@@ -70,45 +70,66 @@ return new Response(responseStream, {
 It compiles and runs cleanly against `1.170.x` — it just never closes the
 response.
 
-## Mechanism (traced against router-core 1.171.13)
+## Mechanism (instrumented trace, router-core 1.171.13)
 
-1. `createRequestHandler` ([`createRequestHandler.js`](https://github.com/TanStack/router/blob/main/packages/router-core/src/ssr/createRequestHandler.ts))
-   normalizes the callback's return value:
-   a plain `Response` gets `serverSsrCleanup: "none"`, so the handler's
-   `finally` block calls `router.serverSsr.cleanup()` **as soon as the
-   callback returns — while the response body is still streaming.**
-2. `cleanup()` sets `cleanupStarted = true` and clears
-   `renderFinishedListeners` (`ssr-server.ts`).
-3. From that point the guard in `onRenderFinished`
-   (`ssr-server.ts`, the line PR #7591 touches):
+Logging added to `ssr-server.ts` and `router-ssr-query-core` shows this
+sequence on every hanging request:
 
-   ```js
-   onRenderFinished: (listener) => {
-       if (cleanupStarted || streamFastPathReserved) return; // silently dropped
-       renderFinishedListeners.push(listener);
-   },
-   ```
+```
+1. onRenderFinished   registered OK (listeners=1)        ← ssr-query's close listener, during dehydrate()
+2. reserveStreamFastPath  returns false                   ← transform takes the main stream path
+3. cleanup()          wipes renderFinishedListeners=1,    ← createRequestHandler's `finally`,
+                      serializationFinishedListeners=1       while the body is STILL STREAMING
+4. ssr-query teardown closes the query stream             ← via onCleanup
+5. setRenderFinished  finds listeners=0                   ← app stream ends; close listener is gone,
+                                                             completion signals destroyed
+```
 
-   drops every listener — including the one
-   `@tanstack/router-ssr-query-core` relies on to close its dehydration
-   query stream.
-4. The query stream never closes → serialization never finishes → the
-   stream transform withholds the closing `</body></html>` and the
-   router-injected module scripts → the response hangs until the 60 s
-   serialization timeout. The browser shows an infinite spinner and the
-   page never hydrates.
+The cause is step 3. `createRequestHandler` changed semantics between the
+two versions:
 
-The only way to avoid the premature `cleanup()` on `1.170.x` is to wrap the
-response in `createSsrStreamResponse(router, response)` — **an API that did
-not exist in `1.169.0`**, so there was no migration path to it when the
-behaviour changed; existing integrations started hanging silently on
-upgrade. (`renderRouterToStream` does this wrapping internally, which is why
-the built-in handler is unaffected.)
+```js
+// v1.169.0 — once the callback is invoked, the handler NEVER cleans up;
+// the stream transform owns the lifecycle. Any callback return is safe.
+cbWillCleanup = true;
+return cb({ request, router, responseHeaders });
+} finally {
+    if (!cbWillCleanup) router.serverSsr?.cleanup();
+}
+```
 
-`#7529`'s `streamFastPathReserved` arm and this `cleanupStarted` arm are the
-same guard line with the same end state: a silently-dropped
-`onRenderFinished` listener and a response that never closes. Both were
-introduced by the same streaming rework (#7497).
+```js
+// v1.171.x — cleanup is deferred ONLY if the callback's return value is
+// wrapped by createSsrStreamResponse (serverSsrCleanup === "stream").
+// A plain Response → cleanup() fires while the body is still streaming.
+const ssrResponse = normalizeSsrResponse(await cb({ ... }));
+responseOwnsCleanup = ssrResponse.serverSsrCleanup === "stream";
+return ssrResponse.response;
+} finally {
+    if (!responseOwnsCleanup) router.serverSsr?.cleanup();
+}
+```
+
+`cleanup()` clears `renderFinishedListeners` and
+`serializationFinishedListeners` and detaches `router.serverSsr`. The
+in-flight stream transform is left waiting for completion signals whose
+listeners no longer exist, so it never emits the closing
+`</body></html>` / router module scripts, and the response hangs until
+router-core's 60 s serialization timeout.
+
+Returning a plain `Response` was the contract in `1.169.0` — it is exactly
+what `1.169.0`'s own `renderRouterToStream` returned. The wrapper that makes
+`1.171.x` defer cleanup, `createSsrStreamResponse`, **does not exist in
+`1.169.0`**, so there was no migration path when the behaviour changed;
+existing integrations started hanging silently on upgrade.
+(`renderRouterToStream` in `1.171.x` wraps internally, which is why the
+built-in handler is unaffected.)
+
+Note for [#7591](https://github.com/TanStack/router/pull/7591): in this
+trace the ssr-query listener is **not** refused at registration (step 1
+succeeds — the `streamFastPathReserved` arm never fires). It is registered
+and then wiped by the premature `cleanup()`. A fix limited to the
+registration guard does not resolve this reproduction.
 
 ## Production impact (how we found it)
 
