@@ -21,8 +21,16 @@ function Home() {
 		<main style={{ fontFamily: "system-ui", padding: "3rem", maxWidth: 640 }}>
 			<h1>TanStack Router #7529</h1>
 			<p>
-				If you can read this and the tab is <strong>not</strong> stuck on a
-				spinner, SSR streaming finished correctly.
+				<strong>Tab still spinning?</strong> That's the bug. The HTML shell
+				streamed (you can read this), but the response never closes: no{" "}
+				<code>&lt;/body&gt;&lt;/html&gt;</code>, no router module scripts, no
+				hydration — until router-core's ~60s serialization timeout kills the
+				stream. (DevTools → Network: the document request stays{" "}
+				<em>pending</em>.)
+			</p>
+			<p>
+				On <code>@tanstack/react-router@1.169.0</code> the same code closes the
+				stream in ~3 ms and the spinner stops immediately.
 			</p>
 			<pre style={{ background: "#f4f4f5", padding: "1rem", borderRadius: 8 }}>
 				{data.title}
